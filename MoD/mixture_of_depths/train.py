@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import wandb
 
 
 class MoDLlamaTrainer():
@@ -39,6 +40,7 @@ class MoDLlamaTrainer():
         log_steps=1000,
     ):  
         self.model.train()
+        wandb.init(project="MoD",config={"epoch":epochs,"lr":lr,"use_aux_loss":use_aux_loss,"use_aux_predictor":use_aux_predictor})
 
         min_loss = float("inf")
         criterion = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_id)
@@ -103,19 +105,24 @@ class MoDLlamaTrainer():
                     aux_optimizer.step()
 
                 running_loss += loss.detach().cpu().item()
+                wandb.log({"loss":loss})
 
                 if (i+1) % log_steps == 0:
                     avg_loss = running_loss / (i+1)
                     print(f"Loss at step {i+1}: {avg_loss}")
+                    wandb.log({"avg_loss":avg_loss})
                     if use_aux_loss:
                         avg_causal_loss = running_causal_loss / (i+1)
+                        wandb.log({"avg_causal_loss":avg_causal_loss})
                         print(f"Causal Loss at step {i+1}: {avg_causal_loss}")
                     if use_aux_predictor:
                         accuracy = correct / total
                         correct, total = 0, 0
+                        wandb.log({"accuracy":accuracy})
                         print(f"Token Predictor Accuracy at step {i+1}: {accuracy}")
 
             epoch_loss = running_loss / len(self.dataloader)
+            wandb.log({"epoch_loss":epoch_loss})
 
             prev_ckpt_path = None
             if min_loss > epoch_loss:

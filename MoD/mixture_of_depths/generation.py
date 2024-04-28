@@ -165,14 +165,21 @@ class MoDLlama:
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
+        print("Min prompt len : {}".format(min_prompt_len))
         max_prompt_len = max(len(t) for t in prompt_tokens)
+        print("Max prompt len : {}".format(max_prompt_len))
         assert max_prompt_len <= params.max_seq_len
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        print("Filler Tokens shape : {}".format(tokens.shape))
         for k, t in enumerate(prompt_tokens):
+            print(k)
+            print(len(t))
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            print(tokens.shape)
+            # pprint()
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
@@ -180,6 +187,7 @@ class MoDLlama:
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
+            print(tokens.shape)
             logits = self.model.forward(tokens, prev_pos)['output']
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
@@ -189,6 +197,7 @@ class MoDLlama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
+            print(tokens.shape)
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)['output']
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -237,7 +246,7 @@ class MoDLlama:
 
     def text_completion(
         self,
-        prompts: List[str],
+        prompts: List[List[str]],
         temperature: float = 0.6,
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
@@ -267,6 +276,8 @@ class MoDLlama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        print(len(prompt_tokens[0]))
+        print(prompt_tokens)
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
