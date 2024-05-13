@@ -418,6 +418,7 @@ class MoDBlock(nn.Module):
                     print("Before permute 2 : {}".format(x.shape))
                     x = x.permute(1,0,2)
                     print("After permute 2 : {}".format(x.shape))
+                    mask = None
                 h = x + self.attention(
                     self.attention_norm(x), start_pos, freqs_cis, mask
                 )
@@ -426,14 +427,19 @@ class MoDBlock(nn.Module):
 
                 if bsz > 1:
                     print("Before permute 3 : {}".format(out.shape))
-                    out.permute(1,0,2)
+                    out = out.permute(1,0,2)
                     print("After permute 3 : {}".format(out.shape))
             
                 if self.layer_id % self.block_skip and self.router:
                     # multiply router weights with hiddens to put router on gradient path
                     out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
+                    print("Post topk gather shape : {}".format(out.shape))
 
-                out = h + out
+                print("Pre add out shape : {}".format(out.shape))
+                print("Pre add h shape : {}".format(h.shape))
+                out = h.permute(1,0,2) + out
+
+                print("Post addition shape : {}".format(out.shape))
 
                 if self.layer_id % self.block_skip and self.router:
                     # add routed through token hiddens back to previous
@@ -442,12 +448,13 @@ class MoDBlock(nn.Module):
                         index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
                         src=out
                     )
+                    print("Post scatter add shape : {}".format(out.shape))
             elif y is not None:
                 # if skipping token for seq_len of 1
                 out = y
-            # if bsz > 1:
-            #     out = out.permute(1,0,2)
-            #     print("Post permute final shape : {}".format(out.shape))
+            if bsz > 1:
+                out = out.permute(1,0,2)
+                print("Post permute final shape : {}".format(out.shape))
             return out, token_weights, aux_weights, topk_indices
 
 
