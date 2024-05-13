@@ -163,6 +163,8 @@ class Attention(nn.Module):
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
+            print("Mask shape : {}".format(mask.shape))
+            print("Scores shape : {}".format(scores.shape))
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
@@ -289,86 +291,165 @@ class MoDBlock(nn.Module):
 
         """
         # TODO: support batch inference
-        bsz,seq_len = x.size(0),x.size(1)
+        bsz = x.size(0)
+        seq_len = x.size(1)
         token_weights = None
         aux_weights = None
         topk_indices = None
         y = None
         
         # MoD paper mentions routing every other block working best
-        if self.layer_id % self.block_skip and self.router:
-            if self.aux_routing:
-                # when using auxiliary router for inference
-                token_weights = self.aux_router(x).squeeze(2)
-            else:
-                token_weights = self.router(x).squeeze(2)
-
-            token_weights = torch.sigmoid(token_weights)
-            print("Token Weights shape : {}".format(token_weights.shape))
-            if start_pos == 0:
-                k = min(seq_len, self.capacity)
-                topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
-                sorted_indices = torch.argsort(topk_indices)
-            else:
-                # when generating autoregressively
-                sorted_indices = (token_weights > 0.5).nonzero(as_tuple=True)[1].unsqueeze(0)
-                if bsz > 1:
-                    # sorted_indices = torch.stack(sorted_indices).flatten(0,1)
-                    sorted_indices = sorted_indices.transpose(1,0)
-                    print("bs > 1 sorted indices shape : {}".format(sorted_indices.shape))
-                topk_weights = token_weights
-            
-            print("Sorted Indices shape : {}".format(sorted_indices.shape))
-            print("Post topk_weight shape : {}".format(token_weights.shape))
-
-            y = x.clone()
-            x = x.gather(
-                dim=1,
-                index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
-            )
-            seq_len = x.size(1)
-            freqs_cis = freqs_cis[:seq_len]
-
-        if seq_len > 1:
-            mask = torch.full(
-                (seq_len, seq_len), float("-inf"), device=x.device
-            )
-            mask = torch.triu(mask, diagonal=1)
-
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack([
-                torch.zeros((seq_len, start_pos), device=x.device),
-                mask
-            ]).type_as(x)
-
-        if seq_len > 0:
-            h = x + self.attention(
-                self.attention_norm(x), start_pos, freqs_cis, mask
-            )
-
-            out = self.feed_forward(self.ffn_norm(h))
-        
+        if  x.size(1) > 1:
+            print("Prefill Phase")
+            print(x.shape)
             if self.layer_id % self.block_skip and self.router:
-                # multiply router weights with hiddens to put router on gradient path
-                out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
+                if self.aux_routing:
+                    # when using auxiliary router for inference
+                    token_weights = self.aux_router(x).squeeze(2)
+                else:
+                    token_weights = self.router(x).squeeze(2)
 
-            out = h + out
+                token_weights = torch.sigmoid(token_weights)
+                if start_pos == 0:
+                    k = min(seq_len, self.capacity)
+                    topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+                    sorted_indices = torch.argsort(topk_indices)
+                else:
+                    # when generating autoregressively
+                    sorted_indices = (token_weights > 0.5).nonzero(as_tuple=True)[1].unsqueeze(0)
+                    topk_weights = token_weights
 
-            if self.layer_id % self.block_skip and self.router:
-                # add routed through token hiddens back to previous
-                out = y.scatter_add(
+                y = x.clone()
+                x = x.gather(
                     dim=1,
-                    index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
-                    src=out
+                    index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
                 )
-        elif y is not None:
-            # if skipping token for seq_len of 1
-            out = y
-        
-        return out, token_weights, aux_weights, topk_indices
+                seq_len = x.size(1)
+                freqs_cis = freqs_cis[:seq_len]
+
+            if seq_len > 1:
+                mask = torch.full(
+                    (seq_len, seq_len), float("-inf"), device=x.device
+                )
+                mask = torch.triu(mask, diagonal=1)
+
+                # When performing key-value caching, we compute the attention scores
+                # only for the new sequence. Thus, the matrix of scores is of size
+                # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+                # j > cache_len + i, since row i corresponds to token cache_len + i.
+                mask = torch.hstack([
+                    torch.zeros((seq_len, start_pos), device=x.device),
+                    mask
+                ]).type_as(x)
+
+            if seq_len > 0:
+                h = x + self.attention(
+                    self.attention_norm(x), start_pos, freqs_cis, mask
+                )
+
+                out = self.feed_forward(self.ffn_norm(h))
+            
+                if self.layer_id % self.block_skip and self.router:
+                    # multiply router weights with hiddens to put router on gradient path
+                    out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
+
+                out = h + out
+
+                if self.layer_id % self.block_skip and self.router:
+                    # add routed through token hiddens back to previous
+                    out = y.scatter_add(
+                        dim=1,
+                        index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
+                        src=out
+                    )
+            elif y is not None:
+                # if skipping token for seq_len of 1
+                out = y
+            
+            return out, token_weights, aux_weights, topk_indices
+        else:
+            print("Generation Phase")
+            if bsz > 1:
+                print("Before permute 1 : {}".format(x.shape))
+                x = x.permute(1,0,2)
+                print("After permute 1 : {}".format(x.shape))
+            if self.layer_id % self.block_skip and self.router:
+                if self.aux_routing:
+                    # when using auxiliary router for inference
+                    token_weights = self.aux_router(x).squeeze(2)
+                else:
+                    token_weights = self.router(x).squeeze(2)
+
+                token_weights = torch.sigmoid(token_weights)
+                if start_pos == 0:
+                    k = min(seq_len, self.capacity)
+                    topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+                    sorted_indices = torch.argsort(topk_indices)
+                else:
+                    # when generating autoregressively
+                    sorted_indices = (token_weights > 0.5).nonzero(as_tuple=True)[1].unsqueeze(0)
+                    topk_weights = token_weights
+
+                y = x.clone()
+                x = x.gather(
+                    dim=1,
+                    index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
+                )
+                seq_len = x.size(1)
+                freqs_cis = freqs_cis[:seq_len]
+
+            if seq_len > 1:
+                mask = torch.full(
+                    (seq_len, seq_len), float("-inf"), device=x.device
+                )
+                mask = torch.triu(mask, diagonal=1)
+
+                # When performing key-value caching, we compute the attention scores
+                # only for the new sequence. Thus, the matrix of scores is of size
+                # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+                # j > cache_len + i, since row i corresponds to token cache_len + i.
+                mask = torch.hstack([
+                    torch.zeros((seq_len, start_pos), device=x.device),
+                    mask
+                ]).type_as(x)
+
+            if seq_len > 0:
+                if bsz > 1:
+                    print("Before permute 2 : {}".format(x.shape))
+                    x = x.permute(1,0,2)
+                    print("After permute 2 : {}".format(x.shape))
+                h = x + self.attention(
+                    self.attention_norm(x), start_pos, freqs_cis, mask
+                )
+
+                out = self.feed_forward(self.ffn_norm(h))
+
+                if bsz > 1:
+                    print("Before permute 3 : {}".format(out.shape))
+                    out.permute(1,0,2)
+                    print("After permute 3 : {}".format(out.shape))
+            
+                if self.layer_id % self.block_skip and self.router:
+                    # multiply router weights with hiddens to put router on gradient path
+                    out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
+
+                out = h + out
+
+                if self.layer_id % self.block_skip and self.router:
+                    # add routed through token hiddens back to previous
+                    out = y.scatter_add(
+                        dim=1,
+                        index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
+                        src=out
+                    )
+            elif y is not None:
+                # if skipping token for seq_len of 1
+                out = y
+            # if bsz > 1:
+            #     out = out.permute(1,0,2)
+            #     print("Post permute final shape : {}".format(out.shape))
+            return out, token_weights, aux_weights, topk_indices
+
 
 
 class MoDTransformer(nn.Module):
@@ -443,12 +524,9 @@ class MoDTransformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        print("Tokens in shape in tranformer forward : {}".format(tokens.shape))
         seqlen = tokens.size(1)
         h = self.tok_embeddings(tokens)
-        print("H shape : {}".format(h.shape))
         self.freqs_cis = self.freqs_cis.to(h.device)
-        print("freq_cis shape : {}".format(self.freqs_cis.shape))
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None

@@ -19,6 +19,7 @@ from fairscale.nn.model_parallel.initialize import (
 
 from .inference import ModelArgs, MoDTransformer
 from llama.tokenizer import Tokenizer
+import torch.nn as nn
 
 Role = Literal["system", "user", "assistant"]
 
@@ -175,10 +176,10 @@ class MoDLlama:
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
         print("Filler Tokens shape : {}".format(tokens.shape))
         for k, t in enumerate(prompt_tokens):
-            print(k)
-            print(len(t))
+            # print(k)
+            # print(len(t))
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
-            print(tokens.shape)
+            # print(tokens.shape)
             # pprint()
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
@@ -187,7 +188,7 @@ class MoDLlama:
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
-            print(tokens.shape)
+            # print(tokens.shape)
             logits = self.model.forward(tokens, prev_pos)['output']
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
@@ -197,7 +198,7 @@ class MoDLlama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
-            print(tokens.shape)
+            # print(tokens.shape)
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)['output']
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -409,6 +410,16 @@ class MoDLlama:
             }
             for t, unsafe in zip(generation_tokens, unsafe_requests)
         ]
+    
+    @torch.inference_mode()
+    def cal_perplexity(self,inputs,targets):
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
+        outputs = self.model(inputs, start_pos=0)
+        loss = criterion(outputs['output'].permute(0, 2, 1), targets)
+        avg_loss = torch.mean(loss)
+        perplexity = torch.exp(avg_loss).item()
+
+        return perplexity
 
 
 def sample_top_p(probs, p):
@@ -435,3 +446,4 @@ def sample_top_p(probs, p):
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
+
