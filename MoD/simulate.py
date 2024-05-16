@@ -4,7 +4,6 @@ import random
 import pickle
 from collections import deque
 
-"""Layer class to simulate Transformer layer"""
 class Layer:
     def __init__(self, name):
         self.name = name
@@ -13,15 +12,15 @@ class Layer:
         self.setup_lookup()
     
     def setup_lookup(self):
-        with open('./profiling_logs/attention_exec.pkl', 'rb') as file:
+        with open('attention_exec.pkl', 'rb') as file:
             self.attn_lookup = pickle.load(file)
             print(self.attn_lookup)
-        with open('./profiling_logs/ffn_exec.pkl', 'rb') as file:
+        with open('ffn_exec.pkl', 'rb') as file:
             self.ffn_lookup = pickle.load(file)
             print(self.ffn_lookup)
 
     def execute(self,batch_size):
-        # Split the batch based on some random number
+        # time.sleep(self.computation_time)
         if batch_size> 3:
             random_skip = random.randint(1,batch_size//2)
             proces_batch_size = batch_size - random_skip
@@ -32,7 +31,6 @@ class Layer:
         time.sleep(attn_time+ffn_time)
         return attn_time + ffn_time
 
-"""Layer class to simulate Transformer layer with queue to store batch"""
 class LayerQ:
     def __init__(self, name, skip_probability=0.25):
         self.name = name
@@ -69,6 +67,7 @@ class LayerQ:
             print(self.ffn_lookup)
 
     def execute(self):
+        # start_time = time.time()
         start_time = time.time()
         processed_data = list(self.queue)
         self.queue.clear()
@@ -121,7 +120,7 @@ def process_requests(requests, model, latency_bound):
     for request in requests:
         # print("Request")
         start_time = time.time()
-        for _ in range(50):  # 50 decoding steps
+        for _ in range(50):  # 150 decoding steps
             for input_data in request:
                 execution_times = model.simulate_execution(input_data)
         end_time = time.time()
@@ -130,6 +129,7 @@ def process_requests(requests, model, latency_bound):
 
         if total_request_time <= latency_bound:
             processed_requests += 1
+            # print(processed_requests)
         total_execution_time += total_request_time
 
     return processed_requests, total_execution_time
@@ -139,8 +139,10 @@ def process_requests_with_queue(requests, model, latency_bound):
     total_execution_time = 0.0
 
     for req_id,request in enumerate(requests):
+        # print("Request : {}".format(req_id))
         start_time = time.time()
         for _ in range(50):  # 50 decoding steps
+            # print("Decoding")
             execution_times = model.simulate_execution_async(request)
         end_time = time.time()
         total_request_time = end_time - start_time
@@ -184,14 +186,14 @@ latency_bounds = [0.5, 0.7, 2]  # Latency bounds in seconds
 # Process requests for each latency bound and calculate throughput
 for latency_bound in latency_bounds:
     processed_requests, total_execution_time = process_requests(requests, mod_model, latency_bound)
+    # processed_requests, total_execution_time = process_requests_with_queue(requests, mod_model_q, latency_bound)
     throughput = processed_requests / total_execution_time if total_execution_time > 0 else 0
-    print("Baseline")
     print(f"Latency bound: {latency_bound:.2f} seconds")
     print(f"Total execution time: {total_execution_time:.2f} seconds")
     print(f"Processed requests: {processed_requests}")
     print(f"Throughput: {throughput:.2f} requests/second")
     print("-------------------------------------------------------------------------------------------")
-    print("Ours")
+    # processed_requests, total_execution_time = process_requests(requests, mod_model, latency_bound)
     processed_requests, total_execution_time = process_requests_with_queue(requests, mod_model_q, latency_bound)
     throughput = processed_requests / total_execution_time if total_execution_time > 0 else 0
     print(f"Latency bound: {latency_bound:.2f} seconds")
