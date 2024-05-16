@@ -27,7 +27,7 @@ To Sample from the model, run
 python MoD_sampling.py
 ```
 The prompts can be modified inside the file.
-The pretrained models weights are available at : 
+The pretrained models weights are available at : https://drive.google.com/file/d/1N8B2abpNb72Zh9F0FrNHb3nJFb75nOuk/view?usp=sharing
 
 ### Inference Simulation
 To simulate the inference scheduling policies, run:
