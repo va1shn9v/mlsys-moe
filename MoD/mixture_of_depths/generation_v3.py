@@ -17,11 +17,14 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 
-from .inference import ModelArgs, MoDTransformer
+from .inference_v3 import ModelArgs, MoDTransformer
 from llama.tokenizer import Tokenizer
 import torch.nn as nn
-
+import logging 
 Role = Literal["system", "user", "assistant"]
+
+
+logger = logging.getLogger('logger')
 
 
 class Message(TypedDict):
@@ -172,11 +175,12 @@ class MoDLlama:
 
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
-
+             
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
@@ -188,7 +192,9 @@ class MoDLlama:
                 reduction="none",
                 ignore_index=pad_id,
             )
-
+         
+        decoding_steps = 1
+        
         for cur_pos in range(min_prompt_len, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)['output']
             if temperature > 0:
@@ -214,9 +220,16 @@ class MoDLlama:
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+           
+            decoding_steps =  decoding_steps + 1
+            
+            
             if all(eos_reached):
+                logger.info(f'decoding_steps : {decoding_steps}')
                 break
-
+        
+        
+        
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []
@@ -435,4 +448,3 @@ def sample_top_p(probs, p):
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
-

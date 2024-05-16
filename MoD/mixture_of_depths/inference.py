@@ -163,8 +163,6 @@ class Attention(nn.Module):
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            print("Mask shape : {}".format(mask.shape))
-            print("Scores shape : {}".format(scores.shape))
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
@@ -300,8 +298,6 @@ class MoDBlock(nn.Module):
         
         # MoD paper mentions routing every other block working best
         if  x.size(1) > 1:
-            print("Prefill Phase")
-            print(x.shape)
             if self.layer_id % self.block_skip and self.router:
                 if self.aux_routing:
                     # when using auxiliary router for inference
@@ -368,11 +364,8 @@ class MoDBlock(nn.Module):
             
             return out, token_weights, aux_weights, topk_indices
         else:
-            print("Generation Phase")
             if bsz > 1:
-                print("Before permute 1 : {}".format(x.shape))
                 x = x.permute(1,0,2)
-                print("After permute 1 : {}".format(x.shape))
             if self.layer_id % self.block_skip and self.router:
                 if self.aux_routing:
                     # when using auxiliary router for inference
@@ -415,9 +408,7 @@ class MoDBlock(nn.Module):
 
             if seq_len > 0:
                 if bsz > 1:
-                    print("Before permute 2 : {}".format(x.shape))
                     x = x.permute(1,0,2)
-                    print("After permute 2 : {}".format(x.shape))
                     mask = None
                 h = x + self.attention(
                     self.attention_norm(x), start_pos, freqs_cis, mask
@@ -426,20 +417,13 @@ class MoDBlock(nn.Module):
                 out = self.feed_forward(self.ffn_norm(h))
 
                 if bsz > 1:
-                    print("Before permute 3 : {}".format(out.shape))
                     out = out.permute(1,0,2)
-                    print("After permute 3 : {}".format(out.shape))
             
                 if self.layer_id % self.block_skip and self.router:
                     # multiply router weights with hiddens to put router on gradient path
                     out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
-                    print("Post topk gather shape : {}".format(out.shape))
 
-                print("Pre add out shape : {}".format(out.shape))
-                print("Pre add h shape : {}".format(h.shape))
                 out = h.permute(1,0,2) + out
-
-                print("Post addition shape : {}".format(out.shape))
 
                 if self.layer_id % self.block_skip and self.router:
                     # add routed through token hiddens back to previous
@@ -448,13 +432,11 @@ class MoDBlock(nn.Module):
                         index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
                         src=out
                     )
-                    print("Post scatter add shape : {}".format(out.shape))
             elif y is not None:
                 # if skipping token for seq_len of 1
                 out = y
             if bsz > 1:
                 out = out.permute(1,0,2)
-                print("Post permute final shape : {}".format(out.shape))
             return out, token_weights, aux_weights, topk_indices
 
 

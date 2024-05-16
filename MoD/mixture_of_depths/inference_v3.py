@@ -18,19 +18,17 @@ from llama.model import (
     ParallelEmbedding,
     precompute_freqs_cis,
 )
-
 import logging
 
-# Create a logger
-logger = logging.getLogger(__name__)
 
-def create_topk_mask(tensor_size, topk_indices):
-    batch_size, seq_len, _ = tensor_size
-    mask = torch.zeros(batch_size, seq_len, dtype=torch.int)
-    for batch_idx, batch_topk_indices in enumerate(topk_indices):
-        mask[batch_idx, batch_topk_indices] = 1
-    return mask
-
+# Configure the second logger separately
+logger2 = logging.getLogger('logger2')
+handler2 = logging.FileHandler('execution_logger.log')
+formatter2 = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler2.setFormatter(formatter2)
+logger2.addHandler(handler2)
+logger2.setLevel(logging.INFO)
+    
 
 @dataclass  
 class ModelArgs:
@@ -87,25 +85,46 @@ class Attention(nn.Module):
             args.n_heads * self.head_dim,
             bias=False,
             gather_output=False,
+            init_method=lambda x: x
         )
         self.wk = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
             gather_output=False,
+            init_method=lambda x: x
         )
         self.wv = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
             gather_output=False,
+            init_method=lambda x: x
         )
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
             input_is_parallel=True,
+            init_method=lambda x: x
         )
+
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
 
     def forward(
         self,
@@ -136,8 +155,14 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        keys = xk
-        values = xv
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
         
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -186,13 +211,13 @@ class FeedForward(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
         self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
         self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
     def forward(self, x):
@@ -247,11 +272,12 @@ class MoDBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         
         # MoD attributes
+    
         self.aux_routing = args.aux_routing
-        print("self.aux_routing:", self.aux_routing)
-        print("args.routing:",args.routing)
+        
         self.router = None
         self.aux_router = None
+        
         if args.routing:
             self.router = nn.Linear(self.dim, 1, bias=False)
             if args.aux_routing:
@@ -260,8 +286,10 @@ class MoDBlock(nn.Module):
                     nn.SiLU(),
                     nn.Linear(self.dim // 2, 1, bias=False)
                 )
+              
         self.capacity = args.capacity
         self.block_skip = args.router_skip_blocks
+        self.check = 1 
 
     def forward(
         self,
@@ -283,122 +311,201 @@ class MoDBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
+        # TODO: support batch inference
+        bsz = x.size(0)
         seq_len = x.size(1)
         token_weights = None
         aux_weights = None
         topk_indices = None
+        y = None
         
-        topk_mask = None
-
         # MoD paper mentions routing every other block working best
-        if self.layer_id % self.block_skip and self.router:
-            logger.info(f"Layer_ID: {self.layer_id}")
-            if self.aux_routing:
-                # when training we still want to use our base router
-                # but we want to be able to train our aux router
-                aux_weights = self.aux_router(x.detach()).squeeze(2)
-                token_weights = self.router(x).squeeze(2)
-            else:
-                token_weights = self.router(x).squeeze(2)
+        if  x.size(1) > 1:
+            if self.layer_id % self.block_skip and self.router:
+                if self.aux_routing:
+                    # when using auxiliary router for inference
+                    token_weights = self.aux_router(x).squeeze(2)
+                else:
+                    token_weights = self.router(x).squeeze(2)
 
-            self.capacity=143
-            k = min(seq_len, self.capacity)
-                        
-            logger.info(f"sequence_len: {seq_len}, capacity: {self.capacity}, k: {k} ")
+                token_weights = torch.sigmoid(token_weights)
+                if start_pos == 0:
+                    k = min(seq_len, self.capacity)
+                    topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+                    sorted_indices = torch.argsort(topk_indices)
+                else:
+                    # when generating autoregressively
+                    sorted_indices = (token_weights > 0.5).nonzero(as_tuple=True)[1].unsqueeze(0)
+                    topk_weights = token_weights
+
+                y = x.clone()
+                x = x.gather(
+                    dim=1,
+                    index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
+                )
+                seq_len = x.size(1)
+                freqs_cis = freqs_cis[:seq_len]
+
+            if seq_len > 1:
+                mask = torch.full(
+                    (seq_len, seq_len), float("-inf"), device=x.device
+                )
+                mask = torch.triu(mask, diagonal=1)
+
+                # When performing key-value caching, we compute the attention scores
+                # only for the new sequence. Thus, the matrix of scores is of size
+                # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+                # j > cache_len + i, since row i corresponds to token cache_len + i.
+                mask = torch.hstack([
+                    torch.zeros((seq_len, start_pos), device=x.device),
+                    mask
+                ]).type_as(x)
+
+            if seq_len > 0:
+                h = x + self.attention(
+                    self.attention_norm(x), start_pos, freqs_cis, mask
+                )
+
+                out = self.feed_forward(self.ffn_norm(h))
             
-            logger.info(f"Layer_ID: {self.layer_id}")
-            if self.aux_routing:
-                # when training we still want to use our base router
-                # but we want to be able to train our aux router
-                aux_weights = self.aux_router(x.detach()).squeeze(2)
-                token_weights = self.router(x).squeeze(2)
-            else:
-                token_weights = self.router(x).squeeze(2)
+                if self.layer_id % self.block_skip and self.router:
+                    # multiply router weights with hiddens to put router on gradient path
+                    out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
 
-            k = min(seq_len, self.capacity)
-                        
-            logger.info(f"sequence_len: {seq_len}, capacity: {self.capacity}, k: {k} ")
+                out = h + out
+
+                if self.layer_id % self.block_skip and self.router:
+                    # add routed through token hiddens back to previous
+                    out = y.scatter_add(
+                        dim=1,
+                        index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
+                        src=out
+                    )
+            elif y is not None:
+                # if skipping token for seq_len of 1
+                out = y
             
-            logger.info(f"token_weights: {token_weights} ")
+            return out, token_weights, aux_weights, topk_indices
+        else:
+            if bsz > 1:
+                x = x.permute(1,0,2)
+            if self.layer_id % self.block_skip and self.router:
+                if self.aux_routing:
+                    # when using auxiliary router for inference
+                    token_weights = self.aux_router(x).squeeze(2)
+                else:
+                    token_weights = self.router(x).squeeze(2)
+
+                token_weights = torch.sigmoid(token_weights)
+                if start_pos == 0:
+                    self.capacity = 143
+                    k = min(seq_len, self.capacity)
+                    topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+                    sorted_indices = torch.argsort(topk_indices)
+                else:
+                    # when generating autoregressively
+                    sorted_indices = (token_weights > 0.5).nonzero(as_tuple=True)[1].unsqueeze(0)
+                    topk_weights = token_weights
+
+                y = x.clone()
+                x = x.gather(
+                    dim=1,
+                    index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
+                )
+                seq_len = x.size(1)
+                freqs_cis = freqs_cis[:seq_len]
+
+            if seq_len > 1:
+                mask = torch.full(
+                    (seq_len, seq_len), float("-inf"), device=x.device
+                )
+                mask = torch.triu(mask, diagonal=1)
+
+                # When performing key-value caching, we compute the attention scores
+                # only for the new sequence. Thus, the matrix of scores is of size
+                # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+                # j > cache_len + i, since row i corresponds to token cache_len + i.
+                mask = torch.hstack([
+                    torch.zeros((seq_len, start_pos), device=x.device),
+                    mask
+                ]).type_as(x)
+
+            if seq_len > 0:
+                if bsz > 1:
+                    x = x.permute(1,0,2)
+                    mask = None
+               
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+               
+                h = x + self.attention(
+                    self.attention_norm(x), start_pos, freqs_cis, mask
+                )
             
-            topk_weights, topk_indices = torch.topk(torch.sigmoid(token_weights), k=k, sorted=False)
+                end_event.record()
+                torch.cuda.synchronize()
+                
+                start_event.record()
+                   
+                    
+                out = self.feed_forward(self.ffn_norm(h))
+                
+                end_event.record()
+                torch.cuda.synchronize()
 
-            logger.info(f"top_k indices: {topk_indices}")
-                  
-            sorted_indices = torch.argsort(topk_indices)
-
-            y = x.clone()
-
-            logger.info(f"Is it contiguous before gather: {x.is_contiguous()}")
+                if bsz > 1:
+                    out = out.permute(1,0,2)
             
-            x = x.gather(
-                dim=1,
-                index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
-            )
-                        
-            topk_mask = create_topk_mask(y.shape, topk_indices)
-            
+                if self.layer_id % self.block_skip and self.router:
+                    out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
 
-            logger.info(x.shape)
-            logger.info(f"Is it contiguous after gather: {x.is_contiguous()}")
-            x = x.contiguous()
-            logger.info(f"Made it contiguous: {x.is_contiguous()}")
-            seq_len = x.size(1)
-            freqs_cis = freqs_cis[:seq_len]
+                out = h.permute(1,0,2) + out
 
-        if seq_len > 1:
-            mask = torch.full(
-                (seq_len, seq_len), float("-inf"), device=x.device
-            )
-            mask = torch.triu(mask, diagonal=1)
+                if self.layer_id % self.block_skip and self.router:
+                    out = y.scatter_add(
+                        dim=1,
+                        index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
+                        src=out
+                    )
+            elif y is not None:
+                out = y
+            if bsz > 1:
+                out = out.permute(1,0,2)
+            return out, token_weights, aux_weights, topk_indices
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack([
-                torch.zeros((seq_len, start_pos), device=x.device),
-                mask
-            ]).type_as(x)
-
-        h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
-        )
-        
-        out = self.feed_forward(self.ffn_norm(h))
-
-        if self.layer_id % self.block_skip and self.router:
-            # multiply router weights with hiddens to put router on gradient path
-            out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
-
-        out = h + out
-        
-        if self.layer_id % self.block_skip and self.router:
-            # add routed through token hiddens back to previous
-            out = y.scatter_add(
-                dim=1,
-                index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
-                src=out
-            )
-        
-        return out, token_weights, aux_weights, topk_indices,topk_mask
 
 
 class MoDTransformer(nn.Module):
     def __init__(self, params: ModelArgs):
-        
-        #Initialize a MoDTransformer model.
+        """
+        Initialize a MoDTransformer model.
+
+        Args:
+            params (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            params (ModelArgs): Model configuration parameters.
+            vocab_size (int): Vocabulary size.
+            n_layers (int): Number of layers in the model.
+            tok_embeddings (ParallelEmbedding): Token embeddings.
+            layers (torch.nn.ModuleList): List of Transformer blocks.
+            norm (RMSNorm): Layer normalization for the model output.
+            output (ColumnParallelLinear): Linear layer for final output.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+            router (torch.nn.Module): Linear layer for mixture of depth token routing.
+            aux_router (torch.nn.Module): Linear layer for autoregressive mixture of depth token routing.
+        """
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
         self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim,
+            params.vocab_size, params.dim, init_method=lambda x: x
         )
 
         # routers
-        
         self.router = None
         self.aux_router = None
 
@@ -408,7 +515,7 @@ class MoDTransformer(nn.Module):
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False,
+            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
         self.freqs_cis = precompute_freqs_cis(
@@ -417,6 +524,7 @@ class MoDTransformer(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
+    @torch.inference_mode()
     def forward(
         self,tokens: torch.Tensor,
         start_pos: int,
@@ -438,16 +546,9 @@ class MoDTransformer(nn.Module):
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
-        routing_decision = []
-
         outputs = defaultdict(list)
         for i, layer in enumerate(self.layers):
-            h, token_weights, aux_weights, topk_indices, topk_mask = layer(h, start_pos, freqs_cis, mask)
-            
-            if topk_mask is not None:
-                 routing_decision.append(topk_mask)
-                 
-                 
+            h, token_weights, aux_weights, topk_indices = layer(h, start_pos, freqs_cis, mask)
             if i % self.params.router_skip_blocks and self.training:
                 if self.params.aux_routing:
                     outputs['topk_indices'].append(topk_indices.cpu())
@@ -458,7 +559,4 @@ class MoDTransformer(nn.Module):
                     
         h = self.norm(h)
         outputs['output'] = self.output(h).float()
-        if self.params.routing:
-            routing_decision = torch.stack(routing_decision, dim=0)
-            outputs['routing_decsion'] = routing_decision
         return outputs
