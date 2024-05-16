@@ -120,7 +120,7 @@ def process_requests(requests, model, latency_bound):
     for request in requests:
         # print("Request")
         start_time = time.time()
-        for _ in range(50):  # 150 decoding steps
+        for _ in range(50):  # 50 decoding steps
             for input_data in request:
                 execution_times = model.simulate_execution(input_data)
         end_time = time.time()
@@ -146,7 +146,7 @@ def process_requests_with_queue(requests, model, latency_bound):
             execution_times = model.simulate_execution_async(request)
         end_time = time.time()
         total_request_time = end_time - start_time
-        print(total_request_time)
+        # print(total_request_time)
 
         if total_request_time <= latency_bound:
             processed_requests += 1
@@ -186,14 +186,14 @@ latency_bounds = [0.5, 0.7, 2]  # Latency bounds in seconds
 # Process requests for each latency bound and calculate throughput
 for latency_bound in latency_bounds:
     processed_requests, total_execution_time = process_requests(requests, mod_model, latency_bound)
-    # processed_requests, total_execution_time = process_requests_with_queue(requests, mod_model_q, latency_bound)
     throughput = processed_requests / total_execution_time if total_execution_time > 0 else 0
+    print("Baseline")
     print(f"Latency bound: {latency_bound:.2f} seconds")
     print(f"Total execution time: {total_execution_time:.2f} seconds")
     print(f"Processed requests: {processed_requests}")
     print(f"Throughput: {throughput:.2f} requests/second")
     print("-------------------------------------------------------------------------------------------")
-    # processed_requests, total_execution_time = process_requests(requests, mod_model, latency_bound)
+    print("Ours")
     processed_requests, total_execution_time = process_requests_with_queue(requests, mod_model_q, latency_bound)
     throughput = processed_requests / total_execution_time if total_execution_time > 0 else 0
     print(f"Latency bound: {latency_bound:.2f} seconds")
