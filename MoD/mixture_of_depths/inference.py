@@ -18,7 +18,17 @@ from llama.model import (
     ParallelEmbedding,
     precompute_freqs_cis,
 )
+import logging
 
+
+# Configure the second logger separately
+logger2 = logging.getLogger('logger2')
+handler2 = logging.FileHandler('execution_logger.log')
+formatter2 = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler2.setFormatter(formatter2)
+logger2.addHandler(handler2)
+logger2.setLevel(logging.INFO)
+    
 
 @dataclass  
 class ModelArgs:
@@ -262,11 +272,24 @@ class MoDBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         
         # MoD attributes
-        self.router = router
-        self.aux_router = aux_router
+    
         self.aux_routing = args.aux_routing
+        
+        self.router = None
+        self.aux_router = None
+        
+        if args.routing:
+            self.router = nn.Linear(self.dim, 1, bias=False)
+            if args.aux_routing:
+                self.aux_router = nn.Sequential(
+                    nn.Linear(self.dim, self.dim // 2, bias=False),
+                    nn.SiLU(),
+                    nn.Linear(self.dim // 2, 1, bias=False)
+                )
+              
         self.capacity = args.capacity
         self.block_skip = args.router_skip_blocks
+        self.check = 1 
 
     def forward(
         self,
@@ -375,6 +398,7 @@ class MoDBlock(nn.Module):
 
                 token_weights = torch.sigmoid(token_weights)
                 if start_pos == 0:
+                    self.capacity = 143
                     k = min(seq_len, self.capacity)
                     topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
                     sorted_indices = torch.argsort(topk_indices)
@@ -410,30 +434,41 @@ class MoDBlock(nn.Module):
                 if bsz > 1:
                     x = x.permute(1,0,2)
                     mask = None
+               
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+               
                 h = x + self.attention(
                     self.attention_norm(x), start_pos, freqs_cis, mask
                 )
-
+            
+                end_event.record()
+                torch.cuda.synchronize()
+                
+                start_event.record()
+                   
+                    
                 out = self.feed_forward(self.ffn_norm(h))
+                
+                end_event.record()
+                torch.cuda.synchronize()
 
                 if bsz > 1:
                     out = out.permute(1,0,2)
             
                 if self.layer_id % self.block_skip and self.router:
-                    # multiply router weights with hiddens to put router on gradient path
                     out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
 
                 out = h.permute(1,0,2) + out
 
                 if self.layer_id % self.block_skip and self.router:
-                    # add routed through token hiddens back to previous
                     out = y.scatter_add(
                         dim=1,
                         index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
                         src=out
                     )
             elif y is not None:
-                # if skipping token for seq_len of 1
                 out = y
             if bsz > 1:
                 out = out.permute(1,0,2)
@@ -473,14 +508,6 @@ class MoDTransformer(nn.Module):
         # routers
         self.router = None
         self.aux_router = None
-        if params.routing:
-            self.router = nn.Linear(params.dim, 1, bias=False)
-            if params.aux_routing:
-                self.aux_router = nn.Sequential(
-                    nn.Linear(params.dim, params.dim // 2, bias=False),
-                    nn.SiLU(),
-                    nn.Linear(params.dim // 2, 1, bias=False)
-                )
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
